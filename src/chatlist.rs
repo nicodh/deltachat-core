@@ -119,16 +119,22 @@ impl Chatlist {
             ($chat_id:expr) => {
                 concat!(
                     "
-(SELECT id FROM msgs WHERE
-    -- state=`OutDraft`.
-    state=19 AND hidden=1 AND chat_id=",
-                    $chat_id,
-                    " OR
-    -- `InFresh`...`OutDelivered` inclusive, except `OutDraft`.
-    state IN (10,13,16,20,24,26) AND hidden=0 AND chat_id=",
+(SELECT id FROM (
+    -- state=`OutDraft` (at most one draft per chat).
+    SELECT id, timestamp FROM msgs WHERE state=19 AND hidden=1 AND chat_id=",
                     $chat_id,
                     "
-ORDER BY timestamp DESC, id DESC LIMIT 1)"
+    UNION ALL
+    -- Newest of `InFresh`...`OutDelivered` inclusive, except `OutDraft`. Kept
+    -- apart from the draft by UNION ALL, not one OR: with the OR `msgs_index7`
+    -- is unusable and SQLite sorts the whole chat, once per chatlist row.
+    SELECT id, timestamp FROM (
+        SELECT id, timestamp FROM msgs WHERE state IN (10,13,16,20,24,26) AND hidden=0 AND chat_id=",
+                    $chat_id,
+                    "
+        ORDER BY timestamp DESC, id DESC LIMIT 1
+    )
+) ORDER BY timestamp DESC, id DESC LIMIT 1)"
                 )
             };
         }
