@@ -2623,6 +2623,20 @@ UPDATE msgs SET state=24 WHERE state=18; -- Change OutPreparing to OutFailed.
         .await?;
     }
 
+    inc_and_check(&mut migration_version, 165)?;
+    if dbversion < migration_version {
+        // Index for `get_last_message_for_chat()`, which is called for every
+        // visible chatlist item to build its summary, and for other lookups of
+        // the newest message of a chat. Without this index SQLite walks for each
+        // chatlist item through all of the chat's messages and sorts them in a
+        // temp B-tree, which is slow in chats with very many messages
+        sql.execute_migration(
+            "CREATE INDEX msgs_index12 ON msgs (chat_id, timestamp);",
+            migration_version,
+        )
+        .await?;
+    }
+
     let new_version = sql
         .get_raw_config_int(VERSION_CFG)
         .await?
