@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::api::VcardContact;
 use anyhow::{Context as _, Result};
+use deltachat::chat;
 use deltachat::chat::Chat;
 use deltachat::chat::ChatItem;
 use deltachat::chat::ChatVisibility;
@@ -607,6 +608,58 @@ impl From<ChatItem> for JsonrpcMessageListItem {
                 msg_id: msg_id.to_u32(),
             },
             ChatItem::DayMarker { timestamp } => JsonrpcMessageListItem::DayMarker { timestamp },
+        }
+    }
+}
+
+/// A contiguous window of messages of one chat, oldest message first.
+#[derive(Serialize, TypeDef, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageWindow {
+    /// The messages of the window, oldest first.
+    /// Contains neither hidden messages nor day markers.
+    pub items: Vec<WindowItem>,
+
+    /// `timestamp` of the newest message older than the window, if there is one.
+    ///
+    /// Lets the client decide whether the topmost item starts a new day
+    /// without loading - or even knowing - that message.
+    pub prev_timestamp: Option<i64>,
+
+    /// Whether there are more messages older than the window.
+    pub has_older: bool,
+
+    /// Whether there are more messages newer than the window.
+    pub has_newer: bool,
+}
+
+/// One entry of a message window.
+#[derive(Serialize, TypeDef, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowItem {
+    pub msg_id: u32,
+
+    /// The `timestamp` column the message list is ordered by, in seconds.
+    ///
+    /// This is not `Message.sortTimestamp`: the two differ for messages with
+    /// `timestamp=0`, and it is this one that decides the order of the list.
+    pub timestamp: i64,
+}
+
+impl From<chat::MessageWindow> for MessageWindow {
+    fn from(window: chat::MessageWindow) -> Self {
+        MessageWindow {
+            items: window
+                .items
+                .into_iter()
+                .map(|item| WindowItem {
+                    msg_id: item.msg_id.to_u32(),
+                    timestamp: item.timestamp,
+                })
+                .collect(),
+            prev_timestamp: window.prev_timestamp,
+            has_older: window.has_older,
+            has_newer: window.has_newer,
         }
     }
 }

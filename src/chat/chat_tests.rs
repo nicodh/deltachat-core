@@ -6939,3 +6939,275 @@ async fn test_long_html_message() -> Result<()> {
 
     Ok(())
 }
+
+/// Inserts a message with the given `timestamp` and `hidden` flag into the chat.
+///
+/// Bypasses sending so that a chat with an exactly known `(timestamp, id)` order
+/// can be built, including orders that sending cannot produce,
+/// such as several messages sharing one timestamp or `timestamp=0` rows.
+async fn insert_msg_at(
+    t: &TestContext,
+    chat_id: ChatId,
+    timestamp: i64,
+    hidden: bool,
+) -> Result<MsgId> {
+    let row_id = t
+        .sql
+        .insert(
+            "INSERT INTO msgs (chat_id, timestamp, hidden, rfc724_mid) VALUES (?,?,?,?)",
+            (
+                chat_id,
+                timestamp,
+                hidden,
+                format!("{timestamp}@example.org"),
+            ),
+        )
+        .await?;
+    Ok(MsgId::new(u32::try_from(row_id)?))
+}
+
+/// Returns an empty chat and one message per given timestamp, oldest first.
+async fn chat_with_timestamps(t: &TestContext, timestamps: &[i64]) -> Result<(ChatId, Vec<MsgId>)> {
+    let chat_id = t
+        .create_chat_with_contact("bob", "bob@example.net")
+        .await
+        .id;
+    // Creating the chat adds info messages; start from an empty message list instead.
+    t.sql.execute("DELETE FROM msgs", ()).await?;
+
+    let mut msg_ids = Vec::new();
+    for &timestamp in timestamps {
+        msg_ids.push(insert_msg_at(t, chat_id, timestamp, false).await?);
+    }
+    Ok((chat_id, msg_ids))
+}
+
+fn window_msg_ids(window: &MessageWindow) -> Vec<MsgId> {
+    window.items.iter().map(|item| item.msg_id).collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_chat_msgs_window_empty_chat() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let (chat_id, _) = chat_with_timestamps(&t, &[]).await?;
+
+    let window = get_chat_msgs_window(&t, chat_id, None, 10, 10).await?;
+    assert!(window.items.is_empty());
+    assert_eq!(window.prev_timestamp, None);
+    assert!(!window.has_older);
+    assert!(!window.has_newer);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_chat_msgs_window_newest_page() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let timestamps: Vec<i64> = (0..10).map(|i| 1000 + i).collect();
+    let (chat_id, msg_ids) = chat_with_timestamps(&t, &timestamps).await?;
+
+    // Without an anchor the window ends at the newest message,
+    // and `after` does not add anything.
+    let window = get_chat_msgs_window(&t, chat_id, None, 3, 5).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids[6..].to_vec());
+    assert!(window.has_older);
+    assert!(!window.has_newer);
+    assert_eq!(window.prev_timestamp, Some(1005));
+
+    // A page as large as the chat reaches its start.
+    let window = get_chat_msgs_window(&t, chat_id, None, 9, 0).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids);
+    assert!(!window.has_older);
+    assert!(!window.has_newer);
+    assert_eq!(window.prev_timestamp, None);
+
+    // One message short of the start is the off-by-one to watch:
+    // `has_older` is true, and `prev_timestamp` is the message just outside.
+    let window = get_chat_msgs_window(&t, chat_id, None, 8, 0).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids[1..].to_vec());
+    assert!(window.has_older);
+    assert_eq!(window.prev_timestamp, Some(1000));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_chat_msgs_window_around_anchor() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let timestamps: Vec<i64> = (0..10).map(|i| 1000 + i).collect();
+    let (chat_id, msg_ids) = chat_with_timestamps(&t, &timestamps).await?;
+
+    // The anchor is part of the window, `before`/`after` count in addition to it.
+    let window = get_chat_msgs_window(&t, chat_id, Some(msg_ids[5]), 2, 2).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids[3..8].to_vec());
+    assert!(window.has_older);
+    assert!(window.has_newer);
+    assert_eq!(window.prev_timestamp, Some(1002));
+
+    // A window of just the anchor.
+    let window = get_chat_msgs_window(&t, chat_id, Some(msg_ids[5]), 0, 0).await?;
+    assert_eq!(window_msg_ids(&window), vec![msg_ids[5]]);
+    assert!(window.has_older);
+    assert!(window.has_newer);
+    assert_eq!(window.prev_timestamp, Some(1004));
+
+    // Anchored at the oldest message.
+    let window = get_chat_msgs_window(&t, chat_id, Some(msg_ids[0]), 3, 3).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids[..4].to_vec());
+    assert!(!window.has_older);
+    assert!(window.has_newer);
+    assert_eq!(window.prev_timestamp, None);
+
+    // Anchored at the newest message.
+    let window = get_chat_msgs_window(&t, chat_id, Some(msg_ids[9]), 2, 3).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids[7..].to_vec());
+    assert!(window.has_older);
+    assert!(!window.has_newer);
+
+    // Both bounds hit exactly: the whole chat, and neither flag set.
+    let window = get_chat_msgs_window(&t, chat_id, Some(msg_ids[3]), 3, 6).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids);
+    assert!(!window.has_older);
+    assert!(!window.has_newer);
+
+    // One message short on either side.
+    let window = get_chat_msgs_window(&t, chat_id, Some(msg_ids[3]), 2, 5).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids[1..9].to_vec());
+    assert!(window.has_older);
+    assert!(window.has_newer);
+
+    Ok(())
+}
+
+/// Tests that paging with the window's own edges as the next anchor
+/// walks the chat without gaps or duplicates.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_chat_msgs_window_paging() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let timestamps: Vec<i64> = (0..10).map(|i| 1000 + i).collect();
+    let (chat_id, msg_ids) = chat_with_timestamps(&t, &timestamps).await?;
+
+    // Page up from the newest message, 4 messages at a time.
+    let mut window = get_chat_msgs_window(&t, chat_id, None, 3, 0).await?;
+    let mut seen = window_msg_ids(&window);
+    while window.has_older {
+        let anchor = *seen.first().unwrap();
+        window = get_chat_msgs_window(&t, chat_id, Some(anchor), 3, 0).await?;
+        let mut older = window_msg_ids(&window);
+        // The anchor is the last item of the older page and already known.
+        assert_eq!(older.pop(), Some(anchor));
+        older.append(&mut seen);
+        seen = older;
+    }
+    assert_eq!(seen, msg_ids);
+
+    // Page down again.
+    let mut window = get_chat_msgs_window(&t, chat_id, Some(msg_ids[0]), 0, 3).await?;
+    let mut seen = window_msg_ids(&window);
+    while window.has_newer {
+        let anchor = *seen.last().unwrap();
+        window = get_chat_msgs_window(&t, chat_id, Some(anchor), 0, 3).await?;
+        let mut newer = window_msg_ids(&window);
+        assert_eq!(newer.first(), Some(&anchor));
+        seen.append(&mut newer.split_off(1));
+    }
+    assert_eq!(seen, msg_ids);
+
+    Ok(())
+}
+
+/// Tests that messages sharing one timestamp are ordered and paged by id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_chat_msgs_window_equal_timestamps() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let (chat_id, msg_ids) = chat_with_timestamps(&t, &[1000; 5]).await?;
+
+    let window = get_chat_msgs_window(&t, chat_id, None, 10, 0).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids);
+    assert!(!window.has_older);
+
+    // Paging inside the tie group must not return the anchor again on either side.
+    let window = get_chat_msgs_window(&t, chat_id, Some(msg_ids[2]), 1, 1).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids[1..4].to_vec());
+    assert!(window.has_older);
+    assert!(window.has_newer);
+    assert_eq!(window.prev_timestamp, Some(1000));
+
+    Ok(())
+}
+
+/// Tests that `timestamp=0` messages, e.g. the info messages at the start of a chat,
+/// sort to the top of the window.
+///
+/// Their `get_sort_timestamp()` is the sent time, i.e. not the column the list is
+/// ordered by, which is why the window returns the raw `timestamp` column.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_chat_msgs_window_zero_timestamps() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let (chat_id, msg_ids) = chat_with_timestamps(&t, &[0, 0, 1000, 1001]).await?;
+
+    let window = get_chat_msgs_window(&t, chat_id, None, 10, 0).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids);
+    assert_eq!(
+        window.items.iter().map(|i| i.timestamp).collect::<Vec<_>>(),
+        vec![0, 0, 1000, 1001]
+    );
+
+    let window = get_chat_msgs_window(&t, chat_id, Some(msg_ids[2]), 1, 0).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids[1..3].to_vec());
+    assert_eq!(window.prev_timestamp, Some(0));
+    assert!(window.has_older);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_chat_msgs_window_hidden_msgs() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let (chat_id, msg_ids) = chat_with_timestamps(&t, &[1000, 1002]).await?;
+    let hidden_id = insert_msg_at(&t, chat_id, 1001, true).await?;
+
+    // Hidden messages are neither part of the window nor counted for `before`/`after`.
+    let window = get_chat_msgs_window(&t, chat_id, Some(msg_ids[1]), 1, 0).await?;
+    assert_eq!(window_msg_ids(&window), msg_ids);
+    assert!(!window.has_older);
+    assert_eq!(window.prev_timestamp, None);
+
+    // A hidden message is not a valid anchor.
+    assert!(
+        get_chat_msgs_window(&t, chat_id, Some(hidden_id), 1, 1)
+            .await
+            .is_err()
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_chat_msgs_window_invalid_anchor() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let (chat_id, msg_ids) = chat_with_timestamps(&t, &[1000, 1001]).await?;
+    let other_chat_id = create_group(&t, "other").await?;
+    let other_msg_id = insert_msg_at(&t, other_chat_id, 1000, false).await?;
+
+    // A message of another chat is not a valid anchor.
+    assert!(
+        get_chat_msgs_window(&t, chat_id, Some(other_msg_id), 1, 1)
+            .await
+            .is_err()
+    );
+
+    // Neither is a message that does not exist (any more).
+    delete_msgs(&t, &[msg_ids[1]]).await?;
+    assert!(
+        get_chat_msgs_window(&t, chat_id, Some(msg_ids[1]), 1, 1)
+            .await
+            .is_err()
+    );
+
+    // Anchoring at the newest message is the recovery from that.
+    let window = get_chat_msgs_window(&t, chat_id, None, 10, 0).await?;
+    assert_eq!(window_msg_ids(&window), vec![msg_ids[0]]);
+
+    Ok(())
+}

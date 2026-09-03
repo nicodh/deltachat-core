@@ -99,6 +99,102 @@ describe("basic tests", () => {
     });
   });
 
+  describe("message window", function () {
+    let accountId: number;
+    let chatId: number;
+    let allMessageIds: number[];
+
+    before(async () => {
+      accountId = await dc.rpc.addAccount();
+      // Device messages are the only ones an unconfigured account can have.
+      const messageData = {
+        text: null,
+        html: null,
+        viewtype: null,
+        file: null,
+        filename: null,
+        location: null,
+        overrideSenderName: null,
+        quotedMessageId: null,
+        quotedText: null,
+      };
+      const messageId = await dc.rpc.addDeviceMessage(accountId, "label0", {
+        ...messageData,
+        text: "message 0",
+      });
+      chatId = (await dc.rpc.getMessage(accountId, messageId!)).chatId;
+      for (let i = 1; i < 5; i++) {
+        await dc.rpc.addDeviceMessage(accountId, `label${i}`, {
+          ...messageData,
+          text: `message ${i}`,
+        });
+      }
+      // The device chat may contain messages added by the account itself,
+      // so compare the windows against the full list rather than against
+      // the messages added here.
+      allMessageIds = await dc.rpc.getMessageIds(
+        accountId,
+        chatId,
+        false,
+        false,
+      );
+      expect(allMessageIds.length).to.be.greaterThanOrEqual(5);
+    });
+
+    it("without anchor ends at the newest message", async () => {
+      const window = await dc.rpc.getMessageWindow(
+        accountId,
+        chatId,
+        null,
+        2,
+        3,
+      );
+      expect(window.items.map((item) => item.msgId)).to.deep.equal(
+        allMessageIds.slice(-3),
+      );
+      expect(window.hasNewer).to.be.false;
+      expect(window.hasOlder).to.be.true;
+      expect(window.prevTimestamp).to.be.a("number");
+    });
+
+    it("anchored window contains the anchor", async () => {
+      const anchor = allMessageIds[allMessageIds.length - 2];
+      const window = await dc.rpc.getMessageWindow(
+        accountId,
+        chatId,
+        anchor,
+        1,
+        1,
+      );
+      expect(window.items.map((item) => item.msgId)).to.deep.equal(
+        allMessageIds.slice(-3),
+      );
+      expect(window.hasNewer).to.be.false;
+      expect(window.items[1].timestamp).to.be.a("number");
+    });
+
+    it("whole chat in one window", async () => {
+      const window = await dc.rpc.getMessageWindow(
+        accountId,
+        chatId,
+        allMessageIds[0],
+        0,
+        allMessageIds.length - 1,
+      );
+      expect(window.items.map((item) => item.msgId)).to.deep.equal(
+        allMessageIds,
+      );
+      expect(window.hasOlder).to.be.false;
+      expect(window.hasNewer).to.be.false;
+      expect(window.prevTimestamp).to.be.null;
+    });
+
+    it("unknown anchor should throw", async () => {
+      await expect(dc.rpc.getMessageWindow(accountId, chatId, 999999, 1, 1)).to
+        .be.eventually.rejected;
+    });
+  });
+
   describe("configuration", function () {
     let accountId: number;
     before(async () => {

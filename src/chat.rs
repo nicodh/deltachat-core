@@ -3151,6 +3151,165 @@ pub async fn get_chat_msgs_ext(
     Ok(items)
 }
 
+/// One entry of a message window.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct WindowItem {
+    /// Database ID of the message.
+    pub msg_id: MsgId,
+
+    /// The `timestamp` column the message list is ordered by.
+    ///
+    /// This is the raw column, not [`Message::get_sort_timestamp()`]:
+    /// the two differ for messages with `timestamp=0`,
+    /// and it is the raw column that decides the order of the list.
+    pub timestamp: i64,
+}
+
+/// A contiguous window of messages of one chat, oldest message first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageWindow {
+    /// The messages of the window, oldest first.
+    /// Contains neither hidden messages nor day markers.
+    pub items: Vec<WindowItem>,
+
+    /// `timestamp` of the newest message older than the window, if there is one.
+    ///
+    /// Needed to let a client decide whether the topmost item starts a new day
+    pub prev_timestamp: Option<i64>,
+
+    /// Whether there are more messages older than the window.
+    pub has_older: bool,
+
+    /// Whether there are more messages newer than the window.
+    pub has_newer: bool,
+}
+
+/// Returns a window of messages around `anchor`, oldest message first.
+///
+/// The anchor message itself is part of the window;
+/// `before` and `after` count the messages returned in addition to it,
+/// strictly older resp. strictly newer than the anchor.
+/// So a window has at most `before + 1 + after` messages
+///
+/// if `anchor` is `None` use the newest message of the chat as anchor;
+/// For an empty chat this returns an empty window.
+///
+/// Fails if `anchor` is not a visible message of `chat_id`,
+/// e.g. because it was deleted meanwhile.
+/// Callers should recover from that by anchoring elsewhere,
+/// e.g. at the newest message.
+///
+/// The window is paged by keyset, i.e. by the `(timestamp, id)` of the anchor,
+/// the same order `get_chat_msgs()` returns and `get_first_unread_msg()` pages by.
+/// Every query is a bounded range scan on `msgs_index12 (chat_id, timestamp)`,
+/// so the cost depends on `before`/`after`, not on the size of the chat.
+pub async fn get_chat_msgs_window(
+    context: &Context,
+    chat_id: ChatId,
+    anchor: Option<MsgId>,
+    before: u32,
+    after: u32,
+) -> Result<MessageWindow> {
+    let row_to_item = |row: &rusqlite::Row| {
+        Ok(WindowItem {
+            msg_id: row.get("id")?,
+            timestamp: row.get("timestamp")?,
+        })
+    };
+
+    let anchor_pos: Option<(i64, MsgId)> = match anchor {
+        Some(msg_id) => Some(
+            context
+                .sql
+                .query_row_optional(
+                    "SELECT timestamp, id FROM msgs WHERE id=?1 AND chat_id=?2 AND hidden=0",
+                    (msg_id, chat_id),
+                    |row| Ok((row.get("timestamp")?, row.get("id")?)),
+                )
+                .await?
+                .with_context(|| format!("{msg_id} is not a visible message of {chat_id}"))?,
+        ),
+        // Anchor at the newest message of the chat.
+        None => {
+            context
+                .sql
+                .query_row_optional(
+                    "SELECT timestamp, id
+                       FROM msgs
+                      WHERE chat_id=?1 AND hidden=0
+                   ORDER BY timestamp DESC, id DESC
+                      LIMIT 1",
+                    (chat_id,),
+                    |row| Ok((row.get("timestamp")?, row.get("id")?)),
+                )
+                .await?
+        }
+    };
+    let Some((anchor_ts, anchor_id)) = anchor_pos else {
+        // The chat has no visible messages at all.
+        return Ok(MessageWindow {
+            items: Vec::new(),
+            prev_timestamp: None,
+            has_older: false,
+            has_newer: false,
+        });
+    };
+
+    // One row more than requested, to tell `has_older` and the day of the topmost message.
+    // The comparison is written out rather than as a row value `(timestamp, id) < (?2, ?3)`
+    // to match `get_first_unread_msg()`; both have the same query plan.
+    let mut older = context
+        .sql
+        .query_map_vec(
+            "SELECT id, timestamp
+               FROM msgs
+              WHERE chat_id=?1 AND hidden=0
+                AND (timestamp < ?2 OR (timestamp = ?2 AND id < ?3))
+           ORDER BY timestamp DESC, id DESC
+              LIMIT ?4",
+            (chat_id, anchor_ts, anchor_id, before.saturating_add(1)),
+            row_to_item,
+        )
+        .await?;
+    let has_older = older.len() > before as usize;
+    let prev_timestamp = if has_older {
+        older.pop().map(|item| item.timestamp)
+    } else {
+        None
+    };
+    older.reverse();
+
+    let mut items = older;
+    items.push(WindowItem {
+        msg_id: anchor_id,
+        timestamp: anchor_ts,
+    });
+
+    let mut newer = context
+        .sql
+        .query_map_vec(
+            "SELECT id, timestamp
+               FROM msgs
+              WHERE chat_id=?1 AND hidden=0
+                AND (timestamp > ?2 OR (timestamp = ?2 AND id > ?3))
+           ORDER BY timestamp, id
+              LIMIT ?4",
+            (chat_id, anchor_ts, anchor_id, after.saturating_add(1)),
+            row_to_item,
+        )
+        .await?;
+    let has_newer = newer.len() > after as usize;
+    newer.truncate(after as usize);
+    items.append(&mut newer);
+
+    Ok(MessageWindow {
+        items,
+        prev_timestamp,
+        has_older,
+        has_newer,
+    })
+}
+
 /// Marks all unread messages in all chats as noticed.
 /// Ignores messages from blocked contacts, but does not ignore messages in muted chats.
 pub async fn marknoticed_all_chats(context: &Context) -> Result<()> {

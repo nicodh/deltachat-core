@@ -12,8 +12,8 @@ use deltachat::blob::BlobObject;
 use deltachat::calls::ice_servers;
 use deltachat::chat::{
     self, Chat, ChatId, MessageListOptions, add_contact_to_chat, forward_msgs, forward_msgs_2ctx,
-    get_chat_media, get_chat_msgs_ext, get_first_unread_msg, markfresh_chat, marknoticed_all_chats,
-    marknoticed_chat, remove_contact_from_chat,
+    get_chat_media, get_chat_msgs_ext, get_chat_msgs_window, get_first_unread_msg, markfresh_chat,
+    marknoticed_all_chats, marknoticed_chat, remove_contact_from_chat,
 };
 use deltachat::chatlist::Chatlist;
 use deltachat::config::{Config, get_all_ui_config_keys};
@@ -61,6 +61,7 @@ use self::types::{
     location::JsonrpcLocation,
     message::{
         JsonrpcMessageListItem, MessageNotificationInfo, MessageSearchResult, MessageViewtype,
+        MessageWindow,
     },
 };
 use crate::api::types::appversions::JsonrpcAppSource;
@@ -1439,6 +1440,46 @@ impl CommandApi {
             .iter()
             .map(|chat_item| (*chat_item).into())
             .collect::<Vec<JsonrpcMessageListItem>>())
+    }
+
+    /// Returns a window of messages of a chat, oldest message first.
+    ///
+    /// The anchor message itself is part of the window; `before` and `after` count the
+    /// messages returned in addition to it, strictly older resp. strictly newer than it.
+    /// To page, take the first resp. last item of the window as the anchor of the next
+    /// call and drop the anchor from the result, which is already known.
+    ///
+    /// Day markers are not included; `timestamp` per item and `prevTimestamp` are what
+    /// a client needs to derive them, in its own timezone and without loading the
+    /// messages themselves.
+    ///
+    /// Parameters:
+    ///
+    /// * `chat_id` - The chat to take the window from.
+    /// * `anchor_msg_id` - The message the window is centered on, or `null` to anchor at
+    ///   the newest message of the chat. `after` then has no effect and `hasNewer` is
+    ///   `false`. Fails if the message is not a visible message of `chat_id`, e.g.
+    ///   because it was deleted meanwhile; anchor at the newest message to recover.
+    /// * `before` - Number of messages to return that are older than the anchor.
+    /// * `after` - Number of messages to return that are newer than the anchor.
+    async fn get_message_window(
+        &self,
+        account_id: u32,
+        chat_id: u32,
+        anchor_msg_id: Option<u32>,
+        before: u32,
+        after: u32,
+    ) -> Result<MessageWindow> {
+        let ctx = self.get_context(account_id).await?;
+        let window = get_chat_msgs_window(
+            &ctx,
+            ChatId::new(chat_id),
+            anchor_msg_id.map(MsgId::new),
+            before,
+            after,
+        )
+        .await?;
+        Ok(window.into())
     }
 
     async fn get_message(&self, account_id: u32, msg_id: u32) -> Result<MessageObject> {
