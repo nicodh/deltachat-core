@@ -11,6 +11,7 @@ use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use chrono::TimeZone;
 use deltachat_contact_tools::{ContactAddress, sanitize_bidi_characters, sanitize_single_line};
 use mail_builder::mime::MimePart;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use strum_macros::EnumIter;
 
@@ -3210,104 +3211,110 @@ pub async fn get_chat_msgs_window(
     before: u32,
     after: u32,
 ) -> Result<MessageWindow> {
-    let row_to_item = |row: &rusqlite::Row| {
-        Ok(WindowItem {
-            msg_id: row.get("id")?,
-            timestamp: row.get("timestamp")?,
-        })
-    };
+    // Keep the anchor and both sides of the window in the same snapshot:
+    // messages can be deleted or have their timestamp changed concurrently.
+    let query_only = true;
+    context
+        .sql
+        .transaction_ext(query_only, |transaction| {
+            let row_to_item = |row: &rusqlite::Row| {
+                Ok(WindowItem {
+                    msg_id: row.get("id")?,
+                    timestamp: row.get("timestamp")?,
+                })
+            };
 
-    let anchor_pos: Option<(i64, MsgId)> = match anchor {
-        Some(msg_id) => Some(
-            context
-                .sql
-                .query_row_optional(
-                    "SELECT timestamp, id FROM msgs WHERE id=?1 AND chat_id=?2 AND hidden=0",
-                    (msg_id, chat_id),
-                    |row| Ok((row.get("timestamp")?, row.get("id")?)),
-                )
-                .await?
-                .with_context(|| format!("{msg_id} is not a visible message of {chat_id}"))?,
-        ),
-        // Anchor at the newest message of the chat.
-        None => {
-            context
-                .sql
-                .query_row_optional(
-                    "SELECT timestamp, id
+            let anchor_pos: Option<(i64, MsgId)> = match anchor {
+                Some(msg_id) => Some(
+                    transaction
+                        .query_row(
+                            "SELECT timestamp, id FROM msgs WHERE id=?1 AND chat_id=?2 AND hidden=0",
+                            (msg_id, chat_id),
+                            |row| Ok((row.get("timestamp")?, row.get("id")?)),
+                        )
+                        .optional()?
+                        .with_context(|| format!("{msg_id} is not a visible message of {chat_id}"))?,
+                ),
+                // Anchor at the newest message of the chat.
+                None => transaction
+                    .query_row(
+                        "SELECT timestamp, id
+                           FROM msgs
+                          WHERE chat_id=?1 AND hidden=0
+                       ORDER BY timestamp DESC, id DESC
+                          LIMIT 1",
+                        (chat_id,),
+                        |row| Ok((row.get("timestamp")?, row.get("id")?)),
+                    )
+                    .optional()?,
+            };
+            let Some((anchor_ts, anchor_id)) = anchor_pos else {
+                // The chat has no visible messages at all.
+                return Ok(MessageWindow {
+                    items: Vec::new(),
+                    prev_timestamp: None,
+                    has_older: false,
+                    has_newer: false,
+                });
+            };
+
+            // One row more than requested, to tell `has_older` and the day of the topmost message.
+            // The comparison is written out rather than as a row value `(timestamp, id) < (?2, ?3)`
+            // to match `get_first_unread_msg()`; both have the same query plan.
+            let mut older = transaction
+                .prepare(
+                    "SELECT id, timestamp
                        FROM msgs
                       WHERE chat_id=?1 AND hidden=0
+                        AND (timestamp < ?2 OR (timestamp = ?2 AND id < ?3))
                    ORDER BY timestamp DESC, id DESC
-                      LIMIT 1",
-                    (chat_id,),
-                    |row| Ok((row.get("timestamp")?, row.get("id")?)),
-                )
-                .await?
-        }
-    };
-    let Some((anchor_ts, anchor_id)) = anchor_pos else {
-        // The chat has no visible messages at all.
-        return Ok(MessageWindow {
-            items: Vec::new(),
-            prev_timestamp: None,
-            has_older: false,
-            has_newer: false,
-        });
-    };
+                      LIMIT ?4",
+                )?
+                .query_map(
+                    (chat_id, anchor_ts, anchor_id, before.saturating_add(1)),
+                    row_to_item,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let has_older = older.len() > before as usize;
+            let prev_timestamp = if has_older {
+                older.pop().map(|item| item.timestamp)
+            } else {
+                None
+            };
+            older.reverse();
 
-    // One row more than requested, to tell `has_older` and the day of the topmost message.
-    // The comparison is written out rather than as a row value `(timestamp, id) < (?2, ?3)`
-    // to match `get_first_unread_msg()`; both have the same query plan.
-    let mut older = context
-        .sql
-        .query_map_vec(
-            "SELECT id, timestamp
-               FROM msgs
-              WHERE chat_id=?1 AND hidden=0
-                AND (timestamp < ?2 OR (timestamp = ?2 AND id < ?3))
-           ORDER BY timestamp DESC, id DESC
-              LIMIT ?4",
-            (chat_id, anchor_ts, anchor_id, before.saturating_add(1)),
-            row_to_item,
-        )
-        .await?;
-    let has_older = older.len() > before as usize;
-    let prev_timestamp = if has_older {
-        older.pop().map(|item| item.timestamp)
-    } else {
-        None
-    };
-    older.reverse();
+            let mut items = older;
+            items.push(WindowItem {
+                msg_id: anchor_id,
+                timestamp: anchor_ts,
+            });
 
-    let mut items = older;
-    items.push(WindowItem {
-        msg_id: anchor_id,
-        timestamp: anchor_ts,
-    });
+            let mut newer = transaction
+                .prepare(
+                    "SELECT id, timestamp
+                       FROM msgs
+                      WHERE chat_id=?1 AND hidden=0
+                        AND (timestamp > ?2 OR (timestamp = ?2 AND id > ?3))
+                   ORDER BY timestamp, id
+                      LIMIT ?4",
+                )?
+                .query_map(
+                    (chat_id, anchor_ts, anchor_id, after.saturating_add(1)),
+                    row_to_item,
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let has_newer = newer.len() > after as usize;
+            newer.truncate(after as usize);
+            items.append(&mut newer);
 
-    let mut newer = context
-        .sql
-        .query_map_vec(
-            "SELECT id, timestamp
-               FROM msgs
-              WHERE chat_id=?1 AND hidden=0
-                AND (timestamp > ?2 OR (timestamp = ?2 AND id > ?3))
-           ORDER BY timestamp, id
-              LIMIT ?4",
-            (chat_id, anchor_ts, anchor_id, after.saturating_add(1)),
-            row_to_item,
-        )
-        .await?;
-    let has_newer = newer.len() > after as usize;
-    newer.truncate(after as usize);
-    items.append(&mut newer);
-
-    Ok(MessageWindow {
-        items,
-        prev_timestamp,
-        has_older,
-        has_newer,
-    })
+            Ok(MessageWindow {
+                items,
+                prev_timestamp,
+                has_older,
+                has_newer,
+            })
+        })
+        .await
 }
 
 /// Marks all unread messages in all chats as noticed.

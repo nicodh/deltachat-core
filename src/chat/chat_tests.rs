@@ -7211,3 +7211,52 @@ async fn test_get_chat_msgs_window_invalid_anchor() -> Result<()> {
 
     Ok(())
 }
+
+/// Updating a Webxdc info message can move it across the window's anchor.
+/// Each window must use one snapshot, without duplicating or losing messages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_get_chat_msgs_window_concurrent_timestamp_update() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let timestamps: Vec<i64> = (1000..1100).collect();
+    let (chat_id, msg_ids) = chat_with_timestamps(&t, &timestamps).await?;
+    let anchor = msg_ids[50];
+    let ctx = t.ctx.clone();
+    let writer = tokio::spawn(async move {
+        for _ in 0..1000 {
+            for timestamp in [1050, 1075] {
+                ctx.sql
+                    .execute(
+                        "UPDATE msgs SET timestamp=? WHERE id=?",
+                        (timestamp, anchor),
+                    )
+                    .await?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let result = async {
+        for _ in 0..1000 {
+            let window = get_chat_msgs_window(&t, chat_id, Some(anchor), 100, 100).await?;
+            let mut ids = window_msg_ids(&window);
+            ids.sort_unstable();
+            ensure!(ids == msg_ids, "Window duplicated or lost a message");
+            ensure!(
+                window.items.windows(2).all(|pair| {
+                    (pair[0].timestamp, pair[0].msg_id) < (pair[1].timestamp, pair[1].msg_id)
+                }),
+                "Window is not ordered by timestamp and ID"
+            );
+            ensure!(
+                !window.has_older && !window.has_newer && window.prev_timestamp.is_none(),
+                "Whole-chat window has incorrect bounds"
+            );
+        }
+        Ok(())
+    }
+    .await;
+
+    // Join the writer even if a window was inconsistent, before dropping the database.
+    writer.await??;
+    result
+}
