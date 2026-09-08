@@ -3202,7 +3202,7 @@ pub struct MessageWindow {
 ///
 /// The window is paged by keyset, i.e. by the `(timestamp, id)` of the anchor,
 /// the same order `get_chat_msgs()` returns and `get_first_unread_msg()` pages by.
-/// Every query is a bounded range scan on `msgs_index12 (chat_id, timestamp)`,
+/// Every query is a bounded range scan on `msgs_index11 (chat_id, timestamp)`,
 /// so the cost depends on `before`/`after`, not on the size of the chat.
 pub async fn get_chat_msgs_window(
     context: &Context,
@@ -3539,53 +3539,57 @@ pub async fn markfresh_chat(context: &Context, chat_id: ChatId) -> Result<()> {
     Ok(())
 }
 
-/// Returns the message that is immediately followed by the last seen message,
-/// i.e. the oldest unseen incoming message that comes after the newest message
-/// marked as seen.
+/// Returns the oldest unseen incoming message after the newest seen message.
 ///
-/// For the user this is effectively "first unread",
-/// but in reality in the database a seen message _can_ be followed by a fresh
-/// (unseen) message if that message has not been individually marked as seen.
+/// Unseen messages before the newest seen message are ignored, matching the
+/// position of the unread marker in the message list.
 pub async fn get_first_unread_msg(context: &Context, chat_id: ChatId) -> Result<Option<MsgId>> {
-    // Messages are ordered by `(timestamp, id)` here, the same way as in
-    // `get_chat_msgs()`. Both queries use the index
-    // `(state, hidden, chat_id, timestamp)`, see `get_fresh_msg_cnt()`
-    let last_seen: Option<(i64, u32)> = context
-        .sql
-        .query_row_optional(
-            "SELECT timestamp, id
-               FROM msgs
-              WHERE state=?1 AND hidden=0 AND chat_id=?2
-           ORDER BY timestamp DESC, id DESC
-              LIMIT 1",
-            (MessageState::InSeen, chat_id),
-            |row| Ok((row.get("timestamp")?, row.get("id")?)),
-        )
-        .await?;
-    // If nothing was seen yet, all unseen messages of the chat qualify.
-    let (seen_timestamp, seen_id) = last_seen.unwrap_or((i64::MIN, 0));
-
+    let query_only = true;
     context
         .sql
-        .query_row_optional(
-            "SELECT id
-               FROM msgs
-              WHERE state IN (?1, ?2) AND hidden=0 AND chat_id=?3
-                AND (timestamp > ?4 OR (timestamp = ?4 AND id > ?5))
-           -- The `+` keeps SQLite on the index above. To avoid sorting, it would
-           -- otherwise walk the whole chat via `msgs_index11 (chat_id, timestamp)`
-           -- if nothing is unread and nothing was seen yet, e.g. in a channel.
-           ORDER BY +timestamp, id
-              LIMIT 1",
-            (
-                MessageState::InFresh,
-                MessageState::InNoticed,
-                chat_id,
-                seen_timestamp,
-                seen_id,
-            ),
-            |row| row.get("id"),
-        )
+        .transaction_ext(query_only, |transaction| {
+            // Use the same `(timestamp, id)` order and snapshot for all three queries.
+            let last_seen: Option<(i64, MsgId)> = transaction
+                .query_row(
+                    "SELECT timestamp, id
+                       FROM msgs
+                      WHERE state=?1 AND hidden=0 AND chat_id=?2
+                   ORDER BY timestamp DESC, id DESC
+                      LIMIT 1",
+                    (MessageState::InSeen, chat_id),
+                    |row| Ok((row.get("timestamp")?, row.get("id")?)),
+                )
+                .optional()?;
+            // If nothing was seen yet, all unseen messages of the chat qualify.
+            let (seen_timestamp, seen_id) = last_seen.unwrap_or((i64::MIN, MsgId::new(0)));
+
+            // Query each state separately so `msgs_index7 (state, hidden, chat_id,
+            // timestamp)` provides both filtering and ordering. With `state IN (...)`,
+            // SQLite can prefer `msgs_index11` and scan all outgoing messages after
+            // the last seen message, even when there are no unread messages at all.
+            let mut statement = transaction.prepare(
+                "SELECT timestamp, id
+                   FROM msgs
+                  WHERE state=?1 AND hidden=0 AND chat_id=?2
+                    AND (timestamp > ?3 OR (timestamp = ?3 AND id > ?4))
+               ORDER BY timestamp, id
+                  LIMIT 1",
+            )?;
+            let mut first_unread: Option<(i64, MsgId)> = None;
+            for state in [MessageState::InFresh, MessageState::InNoticed] {
+                let candidate = statement
+                    .query_row((state, chat_id, seen_timestamp, seen_id), |row| {
+                        Ok((row.get("timestamp")?, row.get("id")?))
+                    })
+                    .optional()?;
+                if let Some(candidate) = candidate
+                    && first_unread.is_none_or(|first| candidate < first)
+                {
+                    first_unread = Some(candidate);
+                }
+            }
+            Ok(first_unread.map(|(_, msg_id)| msg_id))
+        })
         .await
 }
 

@@ -6940,6 +6940,124 @@ async fn test_long_html_message() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_first_unread_msg_states() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let (chat_id, _) = chat_with_timestamps(&t, &[]).await?;
+    assert_eq!(get_first_unread_msg(&t, chat_id).await?, None);
+
+    // Insert out of timestamp order to ensure the ID is only a tie breaker.
+    let mut ids = Vec::new();
+    for timestamp in [0, 200, 300, 100] {
+        ids.push(insert_msg_at(&t, chat_id, timestamp, false).await?);
+    }
+    t.sql
+        .execute("UPDATE msgs SET state=?", (MessageState::OutDelivered,))
+        .await?;
+    assert_eq!(get_first_unread_msg(&t, chat_id).await?, None);
+
+    t.sql
+        .execute(
+            "UPDATE msgs SET state=? WHERE id=?",
+            (MessageState::InNoticed, ids[2]),
+        )
+        .await?;
+    assert_eq!(get_first_unread_msg(&t, chat_id).await?, Some(ids[2]));
+
+    t.sql
+        .execute(
+            "UPDATE msgs SET state=? WHERE id=?",
+            (MessageState::InFresh, ids[3]),
+        )
+        .await?;
+    assert_eq!(get_first_unread_msg(&t, chat_id).await?, Some(ids[3]));
+
+    // Either status can have the earliest unread message.
+    t.sql
+        .execute(
+            "UPDATE msgs SET state=CASE state WHEN ?1 THEN ?2 ELSE ?1 END
+             WHERE state IN (?1, ?2)",
+            (MessageState::InFresh, MessageState::InNoticed),
+        )
+        .await?;
+    assert_eq!(get_first_unread_msg(&t, chat_id).await?, Some(ids[3]));
+
+    t.sql
+        .execute(
+            "UPDATE msgs SET state=? WHERE id=?",
+            (MessageState::InFresh, ids[0]),
+        )
+        .await?;
+    assert_eq!(get_first_unread_msg(&t, chat_id).await?, Some(ids[0]));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_first_unread_msg_after_seen() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let (chat_id, ids) = chat_with_timestamps(&t, &[100, 100, 100, 200]).await?;
+    t.sql
+        .execute("UPDATE msgs SET state=?", (MessageState::InFresh,))
+        .await?;
+    t.sql
+        .execute(
+            "UPDATE msgs SET state=? WHERE id=?",
+            (MessageState::InNoticed, ids[0]),
+        )
+        .await?;
+    // Equal timestamps across statuses are resolved by ID, not by status.
+    assert_eq!(get_first_unread_msg(&t, chat_id).await?, Some(ids[0]));
+
+    t.sql
+        .execute(
+            "UPDATE msgs SET state=? WHERE id=?",
+            (MessageState::InSeen, ids[1]),
+        )
+        .await?;
+    // The earlier unread message is ignored; a later ID at the same timestamp qualifies.
+    assert_eq!(get_first_unread_msg(&t, chat_id).await?, Some(ids[2]));
+
+    t.sql
+        .execute(
+            "UPDATE msgs SET state=? WHERE id=?",
+            (MessageState::InSeen, ids[3]),
+        )
+        .await?;
+    assert_eq!(get_first_unread_msg(&t, chat_id).await?, None);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_get_first_unread_msg_visibility() -> Result<()> {
+    let t = TestContext::new_alice().await;
+    let (chat_id, ids) = chat_with_timestamps(&t, &[100, 200, 300]).await?;
+    let other_chat_id = create_group(&t, "other").await?;
+    insert_msg_at(&t, other_chat_id, 50, false).await?;
+    let other_seen = insert_msg_at(&t, other_chat_id, 400, false).await?;
+    t.sql
+        .execute("UPDATE msgs SET state=?", (MessageState::InFresh,))
+        .await?;
+    t.sql
+        .execute(
+            "UPDATE msgs SET hidden=1 WHERE id IN (?, ?)",
+            (ids[0], ids[2]),
+        )
+        .await?;
+    t.sql
+        .execute(
+            "UPDATE msgs SET state=? WHERE id IN (?, ?)",
+            (MessageState::InSeen, ids[2], other_seen),
+        )
+        .await?;
+    // Neither hidden rows nor another chat influence the seen/unseen boundary.
+    assert_eq!(get_first_unread_msg(&t, chat_id).await?, Some(ids[1]));
+    t.sql
+        .execute("UPDATE msgs SET hidden=1 WHERE id=?", (ids[1],))
+        .await?;
+    assert_eq!(get_first_unread_msg(&t, chat_id).await?, None);
+    Ok(())
+}
+
 /// Inserts a message with the given `timestamp` and `hidden` flag into the chat.
 ///
 /// Bypasses sending so that a chat with an exactly known `(timestamp, id)` order
